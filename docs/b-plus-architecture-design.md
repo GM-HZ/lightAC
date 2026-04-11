@@ -3,8 +3,8 @@
 ## 1. 文档信息
 
 **文档名称**：手机端轻量 Agent 客户端 B+ 架构方案设计
-**版本**：v1.0 Draft
-**日期**：2026-04-10
+**版本**：v1.1 Draft
+**日期**：2026-04-11
 **对应 PRD**：`docs/prd.md`
 **目标读者**：产品、客户端、服务端、daemon、provider adapter、runtime backend 开发
 
@@ -12,11 +12,11 @@
 
 ## 2. 设计结论
 
-V1 直接采用 B+ 方案：
+B+ 优化部分定位为 V1.1 演进，V1 主链路保持不变：
 
 ```text
-WebRTC DataChannel
-  + signaling
+WebRTC/Data Transport
+  + signaling / room coordination
   + TURN fallback
   + remote daemon / session gateway
   + provider adapter
@@ -25,9 +25,13 @@ WebRTC DataChannel
 
 一句话定义：
 
-> WebRTC 是实时传输层，daemon/session gateway 是结构化状态层，Session Runtime Backend 是会话运行与恢复层，手机 App 是可视化控制层。
+> WebRTC/Data Transport 是实时传输层，daemon/session gateway 是结构化状态层，Session Runtime Backend 是会话运行与恢复层，手机 App 是可视化控制层。
 
-本方案不做 WebRTC 远程终端，不做纯聊天客户端，也不把 CLI/tmux 作为长期唯一运行形态。V1 默认通过 tmux/pty CLI backend 托管当前 CLI 形态的 Codex；未来如果 Codex、Claude Code 或其他 provider 演进为 server/native session 模式，可以切换到 `ProviderServerBackend` 或 `CloudAgentBackend`，而不影响 App、协议层和信息流体验。
+这里的 WebRTC/Data Transport、signaling / room coordination、TURN fallback 等增强能力属于 V1.1 演进，不表示 V1 已切换当前主链路。
+
+V1.1 不要求一开始自建完整 WebRTC 基础设施。M0 优先走本地局域网验证；M1/M2 可以使用 LiveKit Cloud 等 PaaS 托管 signaling、NAT 穿透和 TURN fallback；生产阶段再根据成本、稳定性和数据边界决定继续 PaaS、自建 LiveKit，或回到自研 signaling + coturn。
+
+本方案不做 WebRTC 远程终端，不做纯聊天客户端，也不把 CLI/tmux 作为长期唯一运行形态。即使进入 V1.1，runtime 默认仍通过 tmux/pty CLI backend 托管当前 CLI 形态的 Codex；未来如果 Codex、Claude Code 或其他 provider 演进为 server/native session 模式，可以切换到 `ProviderServerBackend` 或 `CloudAgentBackend`，而不影响 App、协议层和信息流体验。
 
 ---
 
@@ -59,17 +63,17 @@ WebRTC DataChannel
 * provider adapter 屏蔽 provider 差异
 * runtime backend 屏蔽会话运行方式差异
 
-### 3.3 V1 可落地
+### 3.3 V1.1 可落地
 
-V1 只支持 Codex，但架构要为多 provider 和多 runtime 留接口。
+V1.1 只支持 Codex，但架构要为多 provider 和多 runtime 留接口。
 
-V1 默认 runtime 是 tmux/pty CLI backend，因为当前本地/远端 coding agent 大量仍以 CLI 方式运行。但所有上层协议都不能写死 tmux。
+V1.1 默认 runtime 是 tmux/pty CLI backend，因为当前本地/远端 coding agent 大量仍以 CLI 方式运行。但所有上层协议都不能写死 tmux。
 
 ### 3.4 前台实时，后台 push-only
 
 移动端不承诺后台长连接实时在线。
 
-V1 的实时能力只在 App 前台打开 session 时提供：
+V1.1 的实时能力只在 App 前台打开 session 时提供：
 
 * App 前台：建立 WebRTC DataChannel，实时接收事件和发送控制消息
 * App 后台/锁屏：关闭或挂起实时连接，依赖 push notification 唤醒用户
@@ -112,8 +116,10 @@ V1 必须默认启用：
 
 ```text
 Mobile App
-  -> Signaling Service
-  -> WebRTC DataChannel
+  -> Transport Layer
+       -> M0 Local LAN WebRTC / local transport
+       -> PaaS WebRTC provider, e.g. LiveKit Cloud
+       -> Self-hosted LiveKit / custom signaling + coturn
   -> Remote Daemon / Session Gateway
   -> Provider Adapter
   -> Session Runtime Backend
@@ -127,11 +133,11 @@ Mobile App
 
 ```text
 Mobile App：用户手机端客户端
-Cloud Control Plane：账号、配对、signaling、push、TURN credential
+Cloud Control Plane / PaaS Transport：账号、配对、room/signaling、push、TURN credential
 Remote Daemon / Session Gateway：运行在用户服务器/开发机上的 agent-side server
 ```
 
-其中 WebRTC DataChannel 的数据面是 `Mobile App <-> Remote Daemon`，两端在 WebRTC 语义里是 peer；但从产品和部署视角看，remote daemon 承担 server 角色，手机 App 承担 client 角色，cloud control plane 承担控制面服务角色。
+其中实时数据面是 `Mobile App <-> Remote Daemon`。如果使用 LiveKit 等 PaaS，App 和 daemon 都是 room participant，Agent Work Protocol 通过 LiveKit data API 承载；如果自建，则可以直接使用 WebRTC DataChannel。无论底层 transport 如何变化，App 和 daemon 之间传输的业务语义仍是 Agent Work Protocol。
 
 ### 4.1 Mobile App
 
@@ -193,6 +199,91 @@ Remote Daemon / Session Gateway：运行在用户服务器/开发机上的 agent
 * 完整终端流
 * 大文件传输
 * 长历史日志回放
+
+### 4.3.1 Transport Provider 策略
+
+Transport Layer 可以分阶段实现，避免 V1 一开始承担完整 WebRTC 基础设施复杂度。
+
+#### M0：本地局域网验证
+
+目标：
+
+* 验证 Agent Work Protocol
+* 验证 daemon/runtime/backend
+* 验证 App/测试客户端的信息流体验
+
+策略：
+
+* daemon 和测试客户端在同一局域网
+* 可以先不接入 TURN
+* 可以使用临时 WebSocket transport 或本地 WebRTC/Pion 直连
+* 如果 Flutter App 尚未启动，可先用 Go/Flutter 最小测试客户端
+* 不验证复杂 NAT，不验证生产级 signaling
+
+M0 的结论只用于判断业务协议和 daemon 是否成立，不用于证明公网移动网络可用。
+
+M0 推荐顺序：
+
+1. 先用本地 WebSocket transport 跑通 Agent Work Protocol、daemon、Event Store 和 Runtime Backend。
+2. 再用 Flutter + LiveKit/Pion 最小客户端验证实时 data channel。
+3. 最后再引入 PaaS room/token 流程。
+
+#### M1/M2：PaaS Transport
+
+推荐优先使用 LiveKit Cloud 等 PaaS。
+
+PaaS 承担：
+
+* room/signaling
+* NAT traversal
+* TURN fallback
+* Flutter SDK
+* 连接质量基础能力
+
+我们仍然承担：
+
+* daemon
+* Provider Adapter
+* Runtime Backend
+* Agent Work Protocol
+* Event Store / cursor resume
+* attention / notification 业务判断
+* 安全和审计
+
+LiveKit data API 可用于承载 Agent Work Protocol。根据官方文档，LiveKit 的数据能力覆盖 text streams、RPC、data packets 等模式；data packets 支持 guaranteed 或 lossy 的消息投递选择。业务上仍需保留 Event Store 和 cursor，因为实时传输层不等于离线可靠队列。
+
+LiveKit 接入形态：
+
+```text
+Mobile App participant
+  <-> LiveKit room
+  <-> Daemon participant
+```
+
+control plane 负责签发 LiveKit room token，App 和 daemon 使用 token 加入同一个 room。Agent Work Protocol 消息通过 LiveKit data API 发送，daemon/event store 仍然负责可靠业务状态。
+
+#### 生产阶段：继续 PaaS 或自建
+
+生产阶段再根据以下因素决策：
+
+* PaaS 成本
+* 中国网络可用性
+* TURN fallback 比例
+* 数据合规边界
+* SDK 稳定性
+* 是否需要自定义连接策略
+
+可选路径：
+
+* 继续使用 LiveKit Cloud
+* 自建 LiveKit
+* 自研 signaling + coturn
+
+设计要求：
+
+* Agent Work Protocol 不绑定 LiveKit
+* Transport Provider 通过接口抽象
+* App/daemon 可在不同 transport provider 之间切换
 
 ### 4.4 Remote Daemon / Session Gateway
 
@@ -266,21 +357,22 @@ V1 默认：
 
 ### 5.1 推荐结论
 
-V1 推荐技术栈：
+V1.1 推荐技术栈：
 
 | 模块 | 推荐语言 / 技术 | 选择理由 |
 |---|---|---|
-| Mobile App | React Native + TypeScript | 迭代快，适合信息流 UI，协议类型可与 Web/服务端共享，生态成熟 |
-| WebRTC Native Layer | `react-native-webrtc` + 少量原生桥接 | 支持 DataChannel，能覆盖 iOS/Android，必要时可下沉到 Swift/Kotlin |
-| Cloud Control Plane | TypeScript + Node.js | 适合 signaling、WebSocket、REST、push、后台管理，和协议 schema 共享成本低 |
+| Mobile App | Flutter + Dart | 更适合 Java/Go 背景，强类型、工程结构统一，适合信息流 UI 和跨端一致性 |
+| Realtime SDK | LiveKit Flutter SDK；自建阶段可评估 `flutter_webrtc` | PaaS 阶段优先使用 LiveKit SDK，降低 WebRTC 原生细节复杂度 |
+| Cloud Control Plane | Go | 用户熟悉 Go/Java，Go 适合 signaling token、room token、push 路由和轻量 API |
+| Transport PaaS | LiveKit Cloud 优先验证 | 托管 room/signaling/TURN，降低 M1/M2 验证成本 |
 | Remote Daemon / Session Gateway | Go | 静态二进制分发方便，适合长期运行、进程管理、pty/tmux、WebRTC、并发和网络 |
-| WebRTC Go 实现 | Pion WebRTC | Go 生态里成熟的 WebRTC/DataChannel 实现 |
+| WebRTC Go 实现 | Pion WebRTC 或 LiveKit Go SDK | M0 可用 Pion/本地 transport；PaaS 阶段优先接 LiveKit |
 | Runtime Backend | Go interface | 与 daemon 同进程，便于管理进程、pty、事件流和本地状态 |
-| Protocol Schema | JSON Schema / TypeSpec + 代码生成 | 先用 JSON 降低调试成本，再生成 TypeScript types 和 Go structs |
+| Protocol Schema | JSON Schema / protobuf + 代码生成 | 先用 JSON 降低调试成本，再生成 Dart models 和 Go structs；后续可切 protobuf |
 | Event Store | SQLite | daemon 本地轻量持久化，便于 cursor resume 和离线事件补拉 |
 | Cloud DB | PostgreSQL | 存用户、设备、daemon registry、pairing、push token |
 | Cloud Cache | Redis | daemon 在线状态、短期 pairing token、signaling 临时状态 |
-| TURN | coturn | 成熟稳定，不自研 TURN server |
+| TURN | PaaS 内置 TURN；自建阶段用 coturn | 初期不自建 TURN，生产自建时再引入 coturn |
 
 ### 5.2 为什么 daemon 推荐 Go
 
@@ -304,24 +396,27 @@ Go 在这些点上比 Node.js 更适合作为 daemon：
 
 Rust 也适合 daemon，但 V1 开发成本更高；Node.js 适合快速原型，但做本机 daemon、pty、WebRTC、长期进程管理时打包和稳定性会更麻烦。
 
-### 5.3 为什么 App 推荐 React Native + TypeScript
+### 5.3 为什么 App 推荐 Flutter + Dart
 
 Mobile App 的核心是信息流 UI 和轻量交互，不是重图形或本地复杂计算。
 
-React Native 的优势：
+考虑到主要开发背景是 Java/Go，Flutter 比 React Native 更适合作为 V1 移动端技术栈。
 
-* 适合快速搭建 session 列表、AgentEvent 卡片、confirmation card
-* TypeScript 可以直接复用协议类型
-* iOS/Android 双端成本低
-* 后续如果需要 Web 控制台，也能复用大量 UI 思路和 schema
+Flutter 的优势：
+
+* Dart 的强类型和类模型更接近 Java/Go 心智
+* Flutter widget 体系统一，适合构建 AgentEvent 信息流、状态卡片和 confirmation card
+* iOS/Android UI 一致性强
+* 列表性能和动画控制适合实时信息流
+* 配合 LiveKit Flutter SDK 可以降低 WebRTC 接入复杂度
 
 注意：
 
-* 不建议依赖纯 Expo Go 路线，因为 WebRTC、push、后台状态可能需要原生能力。
-* 可以使用 React Native CLI 或 Expo custom dev client。
-* WebRTC、push notification、keychain/keystore 这些能力要从一开始按原生模块边界设计。
+* `flutter_webrtc` 或 LiveKit Flutter SDK 的 DataChannel/data API 稳定性必须在 M0/M1 验证
+* push notification、secure storage、deep link、后台状态要从一开始按平台边界设计
+* 协议类型需要从 schema 生成 Dart models，不能手写漂移
 
-### 5.4 为什么 Cloud Control Plane 推荐 TypeScript
+### 5.4 为什么 Cloud Control Plane 推荐 Go
 
 Cloud Control Plane 主要是业务控制面，不是高性能数据面。
 
@@ -335,12 +430,21 @@ Cloud Control Plane 主要是业务控制面，不是高性能数据面。
 * TURN credential 下发
 * push notification routing
 
-这些能力用 TypeScript + Node.js 开发效率高，和 App 共享协议类型成本低。V1 可以选择：
+如果使用 LiveKit Cloud，control plane 在 V1 不需要自建完整 signaling，只需要负责：
 
-* Fastify：轻量、性能好、结构清晰
-* NestJS：工程约束强，适合团队协作
+* 用户和设备身份
+* daemon registry
+* pairing
+* LiveKit room/token 签发
+* push notification routing
 
-如果后续 signaling 并发压力很高，可以把 signaling gateway 单独用 Go 重写，但 V1 没必要提前复杂化。
+这些能力用 Go 实现足够轻量，也能和 daemon 共享协议结构、错误码和部分工具代码。V1 可以选择：
+
+* `chi`：简单、标准库风格强
+* `Gin`：生态成熟，上手快
+* `ConnectRPC` / gRPC：后续若需要强类型 RPC 可引入
+
+建议 V1 使用 Go + chi，保持后端语言统一。
 
 ### 5.5 协议和类型共享
 
@@ -350,7 +454,7 @@ Cloud Control Plane 主要是业务控制面，不是高性能数据面。
 packages/protocol
   schemas/
   generated/
-    typescript/
+    dart/
     go/
 ```
 
@@ -358,7 +462,7 @@ V1 消息编码建议：
 
 * DataChannel 业务消息使用 JSON
 * 每条消息使用统一 envelope
-* schema 使用 JSON Schema 或 TypeSpec 管理
+* schema 使用 JSON Schema 或 protobuf schema 管理
 * CI 中校验 schema 兼容性
 
 后续如果消息量上升，可以在不改变语义协议的前提下切换为 MessagePack 或 protobuf。
@@ -369,8 +473,8 @@ V1 消息编码建议：
 
 ```text
 apps/
-  mobile/                 # React Native + TypeScript
-  control-plane/          # TypeScript + Node.js
+  mobile/                 # Flutter + Dart
+  control-plane/          # Go control plane
 daemon/
   cmd/lightac-daemon/      # Go daemon entry
   internal/session/
@@ -381,16 +485,18 @@ daemon/
 packages/
   protocol/               # schema + generated types
 infra/
-  coturn/
+  livekit/
+  coturn/                  # 自建阶段再启用
   docker/
 docs/
 ```
 
 这样语言分工清楚：
 
-* TypeScript 负责产品 UI、控制面业务和协议声明
-* Go 负责远端 daemon、runtime backend 和本机系统能力
-* coturn 负责 TURN，不自研
+* Dart/Flutter 负责移动端 UI
+* Go 负责 control plane、远端 daemon、runtime backend 和本机系统能力
+* LiveKit Cloud 在初期负责 transport PaaS
+* coturn 只在自建 transport 阶段引入
 
 ### 5.7 可替代方案
 
@@ -400,13 +506,13 @@ docs/
 * 优点是 iOS 体验和 WebRTC 原生控制更强。
 * 缺点是双端成本高，协议和 UI 复用弱。
 
-如果团队更偏 Flutter：
+如果团队后续引入成熟前端/React 经验：
 
-* App 可用 Flutter + Dart。
-* 优点是跨端一致性强，`flutter_webrtc` 可用。
-* 缺点是团队如果主要是 TS/React 背景，产品迭代和生态协作成本可能更高。
+* App 可重新评估 React Native + TypeScript。
+* 优点是 Web 控制台和前端生态复用强。
+* 缺点是对当前 Java/Go 背景不如 Flutter 直接。
 
-V1 综合建议仍是 React Native + TypeScript、Go daemon、TypeScript control plane。
+V1.1 综合建议为 Flutter + Dart、Go control plane、Go daemon、LiveKit Cloud transport。
 
 ---
 
@@ -1696,6 +1802,7 @@ V1 可先使用内部 dogfood SLO：
 * 估算 high-confidence AgentEvent coverage
 * 验证 message injection、waiting、completed、error 的识别方式
 * 进行 Claude Code 纸面适配验证
+* 本地局域网 transport 跑通最小 Agent Work Protocol
 
 验收：
 
@@ -1704,6 +1811,7 @@ V1 可先使用内部 dogfood SLO：
 * high-confidence AgentEvent coverage >= 60%，否则暂停 M2 并重新评估 provider-native structured output/API 路线
 * 产出 Claude Code 典型工作流到 AgentEvent / RunState 的映射表
 * 明确 V1 CodexAdapter 的可承诺事件范围
+* 本地 WebSocket 或局域网 WebRTC 能完成 `hello` / `heartbeat` / `event.appended`
 
 ### M1：协议和 daemon 骨架
 
@@ -1714,6 +1822,7 @@ V1 可先使用内部 dogfood SLO：
 * hello / session.list / heartbeat 跑通
 * 本地 event store 可写入和读取
 * hello 阶段完成协议版本和 capability negotiation
+* LiveKit Cloud room/token spike 跑通
 
 验收：
 
@@ -1721,6 +1830,7 @@ V1 可先使用内部 dogfood SLO：
 * daemon 能返回 mock session
 * cursor 机制可补拉 mock event
 * App 版本高于/低于 daemon 时能按 capability 降级或明确失败
+* Flutter 或测试客户端可通过 LiveKit data API 与 daemon 交换 envelope
 
 ### M2：Codex CLI session
 
@@ -1785,13 +1895,13 @@ V1 可先使用内部 dogfood SLO：
 
 该风险真实存在。B+ 同时包含 Mobile App、Cloud Control Plane、Remote Daemon、TURN、runtime backend，明显比 SSH/Mosh 方案复杂。
 
-但 SSH/Mosh 只能验证“手机远程进终端”，不能验证“结构化 agent 工作信息流”。因此不建议回退到 SSH 主路径，而是收窄 V1。
+但 SSH/Mosh 只能验证“手机远程进终端”，不能验证“结构化 agent 工作信息流”。因此不建议回退到 SSH 主路径，而是收窄 V1.1。
 
 缓解：
 
-* V1 只支持 Codex
-* V1 只支持单用户
-* V1 默认只实现 tmux/pty CLI backend
+* V1.1 只支持 Codex
+* V1.1 只支持单用户
+* V1.1 默认只实现 tmux/pty CLI backend
 * provider/server/cloud backend 只保留接口，不实现
 * TURN 使用 coturn，不自研
 * control plane 只做账号、配对、signaling、push、TURN credential
@@ -1907,9 +2017,9 @@ V1 可先使用内部 dogfood SLO：
 
 1. Codex CLI 的启动、恢复和消息注入方式，以当前本机环境为准需要再做技术探测。
 2. Codex CLI 输出中哪些状态可以高置信解析，哪些必须降级为低置信事件或 terminal peek。
-3. React Native WebRTC 在目标 iOS/Android 版本上的 DataChannel 稳定性。
+3. Flutter + LiveKit data API 在目标 iOS/Android 版本上的稳定性。
 4. terminal peek 在 V1 是否纳入用户可见能力，还是作为 debug-only 能力。
-5. control plane V1 使用 Fastify 还是 NestJS。
+5. M0 本地 transport 使用临时 WebSocket 还是局域网 WebRTC/Pion 直连。
 6. Claude Code 纸面适配验证是否发现当前 AgentEvent / RunState 缺失关键语义。
 
 ---

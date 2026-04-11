@@ -1,0 +1,11 @@
+# Go build outputs
+tools/m0-client/m0-client
+lightac-daemon
+
+# Local M0 data
+*.db
+*.db-shm
+*.db-wal
+
+# OS/editor noise
+.DS_Store

@@ -1096,7 +1096,7 @@ TURN 只作为 fallback，不作为默认主链路。
 
 ### 20.7 结论
 
-V1 直接采用方案 B+：
+V1 主链路保持不变，B+ 优化部分进入 V1.1：
 
 **WebRTC DataChannel + signaling + TURN fallback + remote daemon/session gateway + Session Runtime Backend。**
 
@@ -1104,6 +1104,8 @@ V1 直接采用方案 B+：
 
 > WebRTC 是实时传输层，daemon/session gateway 是结构化状态层，Session Runtime Backend 是会话运行与恢复层，手机 App 是可视化控制层。
 
-V1 默认通过 tmux/pty CLI backend 托管当前 CLI 形态的 Codex；未来如果 provider 演进为 server/native session 模式，可以切换到 ProviderServerBackend 或 CloudAgentBackend，而不影响 App、协议层和信息流体验。
+这里的 WebRTC DataChannel、signaling、TURN fallback 等能力属于 V1.1 增强链路，不表示 V1 已切换当前主链路。
+
+V1.1 默认通过 tmux/pty CLI backend 托管当前 CLI 形态的 Codex；未来如果 provider 演进为 server/native session 模式，可以切换到 ProviderServerBackend 或 CloudAgentBackend，而不影响 App、协议层和信息流体验。
 
 该方案的核心不是复刻终端，也不是绑定 CLI runtime，而是为 coding agent 建立一套适合移动场景的结构化工作协议。
